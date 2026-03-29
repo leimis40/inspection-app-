@@ -1,0 +1,9 @@
+# tietokanta
+*.db
+
+# kuvat
+uploads/
+
+# python
+__pycache__/
+*.pyc
