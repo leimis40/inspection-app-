@@ -8,10 +8,16 @@ from typing import List
 
 import pandas as pd
 import streamlit as st
+from difflib import SequenceMatcher
 
 DB_PATH = os.getenv("INSPECTION_DB_PATH", "inspection_reports.db")
 UPLOAD_DIR = Path(os.getenv("INSPECTION_UPLOAD_DIR", "uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = Path(os.getenv("INSPECTION_DATA_DIR", "data"))
+CSV_KB_PATH = Path(os.getenv("INSPECTION_KB_CSV", DATA_DIR / "inspection_ai_knowledge_base.csv"))
+FINDINGS_CSV_PATH = Path(os.getenv("INSPECTION_FINDINGS_CSV", DATA_DIR / "final_inspection_findings.csv"))
+LEGAL_CSV_PATH = Path(os.getenv("INSPECTION_LEGAL_CSV", DATA_DIR / "final_legal_references.csv"))
+STANDARDS_CSV_PATH = Path(os.getenv("INSPECTION_STANDARDS_CSV", DATA_DIR / "final_standards_clauses.csv"))
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -116,6 +122,107 @@ DEFAULT_METHOD_TEXT = (
 )
 
 DEFAULT_NORMS = "SFS 6000; SFS 6001; STL 1135/2016; VNa 1434/2016; VNa 576/2003"
+
+
+@st.cache_data(show_spinner=False)
+def load_csv_if_exists(path_str: str) -> pd.DataFrame:
+    path = Path(path_str)
+    if path.exists() and path.is_file():
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _pick_first_existing(df: pd.DataFrame, candidates: List[str]) -> str:
+    lower_map = {c.lower(): c for c in df.columns}
+    for candidate in candidates:
+        if candidate.lower() in lower_map:
+            return lower_map[candidate.lower()]
+    return ""
+
+
+def _tokenize(text: str) -> List[str]:
+    return [t.strip() for t in str(text).lower().replace("/", " ").replace(",", " ").replace(";", " ").split() if len(t.strip()) > 2]
+
+
+def suggest_references_from_csv(finding_text: str, limit: int = 5) -> List[dict]:
+    suggestions: List[dict] = []
+    query = str(finding_text or "").strip()
+    if not query:
+        return suggestions
+
+    kb_df = load_csv_if_exists(str(CSV_KB_PATH))
+    if kb_df.empty:
+        standards_df = load_csv_if_exists(str(STANDARDS_CSV_PATH))
+        legal_df = load_csv_if_exists(str(LEGAL_CSV_PATH))
+        frames = []
+        if not standards_df.empty:
+            frames.append(standards_df.copy())
+        if not legal_df.empty:
+            frames.append(legal_df.copy())
+        if frames:
+            kb_df = pd.concat(frames, ignore_index=True, sort=False)
+        else:
+            return suggestions
+
+    text_col = _pick_first_existing(kb_df, ["full_text", "embedding_text", "summary", "text", "content", "finding_text"])
+    ref_col = _pick_first_existing(kb_df, ["reference", "standard_reference", "legal_reference", "clause_number", "section", "pykala"])
+    code_col = _pick_first_existing(kb_df, ["standard_code", "code", "law_code", "document_code", "source_name"])
+    version_col = _pick_first_existing(kb_df, ["standard_version", "version", "year"])
+    heading_col = _pick_first_existing(kb_df, ["heading", "title", "section_title"])
+    type_col = _pick_first_existing(kb_df, ["chunk_type", "source_type", "document_type", "type"])
+
+    if not text_col:
+        return suggestions
+
+    query_tokens = set(_tokenize(query))
+    if not query_tokens:
+        return suggestions
+
+    rows = []
+    for _, row in kb_df.fillna("").iterrows():
+        hay = str(row.get(text_col, ""))
+        if not hay:
+            continue
+        hay_tokens = set(_tokenize(hay))
+        overlap = len(query_tokens & hay_tokens)
+        if overlap == 0:
+            continue
+        similarity = SequenceMatcher(None, query.lower(), hay.lower()[:2000]).ratio()
+        score = overlap * 10 + similarity * 5
+        rows.append((score, row))
+
+    rows.sort(key=lambda x: x[0], reverse=True)
+    for score, row in rows[:limit]:
+        code = str(row.get(code_col, "")).strip() if code_col else ""
+        version = str(row.get(version_col, "")).strip() if version_col else ""
+        ref = str(row.get(ref_col, "")).strip() if ref_col else ""
+        heading = str(row.get(heading_col, "")).strip() if heading_col else ""
+        source_type = str(row.get(type_col, "")).strip() if type_col else ""
+        excerpt = str(row.get(text_col, "")).strip().replace("
+", " ")[:500]
+
+        if code and version and ref and ref not in code:
+            label = f"{code}:{version} {ref}"
+        elif code and ref and ref not in code:
+            label = f"{code} {ref}"
+        elif code and version:
+            label = f"{code}:{version}"
+        else:
+            label = ref or heading or "Viite"
+
+        suggestions.append(
+            {
+                "label": label,
+                "heading": heading,
+                "source_type": source_type,
+                "excerpt": excerpt,
+                "score": round(float(score), 2),
+            }
+        )
+    return suggestions
 
 
 def get_conn() -> sqlite3.Connection:
@@ -338,7 +445,7 @@ def render_report_html(report, findings, conn: sqlite3.Connection) -> str:
 def main() -> None:
     st.set_page_config(page_title="Tarkastuspöytäkirja", layout="wide")
     st.title("Tarkastuspöytäkirjasovellus")
-    st.caption("Streamlit + SQLite. Jokaiselle puutekohtalle voi lisätä valokuvia.")
+    st.caption("Streamlit + SQLite. Jokaiselle puutekohtalle voi lisätä valokuvia. Mukana myös CSV-pohjainen AI-viittausehdotusnappi.")
 
     init_db()
     conn = get_conn()
@@ -470,6 +577,22 @@ def main() -> None:
                     )
 
                 finding_text = st.text_area("Puutteen kuvaus", height=140)
+
+                if finding_text.strip():
+                    suggestions = suggest_references_from_csv(finding_text, limit=5)
+                    st.markdown("#### AI-viittausehdotukset")
+                    if suggestions:
+                        for idx, s in enumerate(suggestions, start=1):
+                            with st.container(border=True):
+                                st.write(f"**{idx}. {s['label']}**")
+                                if s["heading"]:
+                                    st.write(f"Otsikko: {s['heading']}")
+                                if s["source_type"]:
+                                    st.caption(f"Lähdetyyppi: {s['source_type']}")
+                                st.write(s["excerpt"])
+                    else:
+                        st.info("CSV-tietopohjasta ei löytynyt osumia. Lisää CSV-tiedostot data-kansioon tai määritä polut ympäristömuuttujilla.")
+
                 add_finding_btn = st.form_submit_button("Tallenna puutekohta", type="primary")
                 if add_finding_btn:
                     if not finding_text.strip():
@@ -562,3 +685,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
