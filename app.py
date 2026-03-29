@@ -201,8 +201,7 @@ def suggest_references_from_csv(finding_text: str, limit: int = 5) -> List[dict]
         ref = str(row.get(ref_col, "")).strip() if ref_col else ""
         heading = str(row.get(heading_col, "")).strip() if heading_col else ""
         source_type = str(row.get(type_col, "")).strip() if type_col else ""
-        excerpt = str(row.get(text_col, "")).strip().replace("
-", " ")[:500]
+        excerpt = str(row.get(text_col, "")).strip().replace("\n", " ")[:500]
 
         if code and version and ref and ref not in code:
             label = f"{code}:{version} {ref}"
@@ -563,7 +562,7 @@ def main() -> None:
             with st.form("add_finding_form"):
                 c1, c2 = st.columns(2)
                 with c1:
-                    severity_class = st.selectbox("Puutteluokka", ["0", "1", "2"], format_func=lambda x: {"0":"0 - välitön vaara", "1":"1 - vakava puute", "2":"2 - turvallisuutta vähentävä puute"}[x])
+                    severity_class = st.selectbox("Puutteluokka", ["0", "1", "2"], format_func=lambda x: {"0": "0 - välitön vaara", "1": "1 - vakava puute", "2": "2 - turvallisuutta vähentävä puute"}[x])
                     area = st.text_input("Alue", placeholder="esim. Pääkeskus, ryhmäkeskus, lääkintätila")
                     standard_reference = st.text_input("Standardiviite", placeholder="esim. SFS 6000:2022 kohta 514.5.1")
                     legal_reference = st.text_input("Laki-/asetusviite", placeholder="esim. STL 1135/2016 45 §")
@@ -685,4 +684,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
